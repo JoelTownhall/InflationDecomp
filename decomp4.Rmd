@@ -1,0 +1,428 @@
+---
+title: "Inflation Decomposition: Annotated R Code (Quarterly Methodology)"
+author: "Gemini CLI"
+date: "2025-12-27"
+output: html_document
+---
+
+# Inflation Decomposition: Annotated R Code (Quarterly Methodology)
+
+This document provides a step-by-line annotation of the R code used to decompose Australian inflation into supply and demand factors using the Shapiro (2022) / RBA approach.
+
+### Chunk 1: Setup and Package Management
+```{r setup}
+# Sets the default repository for installing packages to the main CRAN mirror.
+options(repos = c(CRAN = "http://cran.us.r-project.org"))
+
+# Define the list of required R packages for data fetching, manipulation, modelling, and plotting.
+pkgs <- c("readabs", "readrba", "tidyverse", "vars", "zoo", "lubridate", "ggplot2", "scales")
+
+# Identify which of the required packages are not currently installed on the system.
+new_pkgs <- pkgs[!(pkgs %in% installed.packages()[,"Package"])]
+
+# Install any missing packages found in the previous step.
+if(length(new_pkgs)) install.packages(new_pkgs)
+
+# Load all the required packages into the R session to make their functions available.
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Create a directory named "outputs" to store the results (CSV, PNG). Suppress warnings if it already exists.
+dir.create("outputs", showWarnings = FALSE)
+```
+
+### Chunk 2: Data Gathering
+```{r data_gathering}
+# Print a status message to the console indicating the start of the HFCE download.
+message("Downloading HFCE data (5206.0)...")
+
+# Download Table 8 from ABS Catalogue 5206.0 (Household Final Consumption Expenditure).
+# 'check_local = FALSE' forces a fresh download instead of using a cached version.
+hfce_raw <- read_abs("5206.0", tables = 8, check_local = FALSE)
+
+# Print a status message indicating the start of the CPI download.
+message("Downloading CPI data (RBA)...")
+
+# Download the historical CPI series (All groups CPI) directly from the RBA database (Series ID: GCPIAG).
+# This is used because the ABS API sometimes limits the history of the headline figure.
+cpi_raw <- read_rba(series_id = "GCPIAG")
+```
+
+### Chunk 3: CPI Data Processing
+```{r cpi_processing}
+# Print a status message indicating the start of CPI processing.
+message("Processing CPI...")
+
+# Create the cleaned headline CPI dataset.
+cpi_headline <- cpi_raw %>%
+  # Sort the data chronologically by date.
+  arrange(date) %>%
+  # Add a new column 'join_date' which normalizes the date to the first day of the quarter.
+  # This ensures we can merge it cleanly with other quarterly data sets.
+  mutate(
+    join_date = floor_date(date, "quarter")
+  ) %>%
+  # Calculate the Year-on-Year inflation rate.
+  # Formula: ((Current Value / Value 4 quarters ago) - 1) * 100.
+  mutate(CPI_YoY = (value / lag(value, 4) - 1) * 100) %>%
+  # Keep only the normalized date and the calculated inflation rate.
+  dplyr::select(join_date, CPI_YoY)
+
+# Print the first 6 rows of the processed CPI data to the console for verification.
+print("CPI Head:")
+print(head(cpi_headline))
+```
+
+### Chunk 4: HFCE Processing and Category Mapping
+```{r hfce_mapping}
+# Print a status message indicating the start of HFCE processing.
+message("Processing HFCE...")
+
+# Filter the raw HFCE data to keep only:
+# 1. Quarterly frequency (ignoring annual summaries).
+# 2. Seasonally Adjusted series (to remove seasonal noise like Christmas spending).
+hfce_q <- hfce_raw %>% 
+  filter(frequency == "Quarter", 
+         series_type == "Seasonally Adjusted") %>%
+  # Add the normalized 'join_date' for merging later.
+  mutate(join_date = floor_date(date, "quarter"))
+
+# Define the 15 standard categories of household consumption we want to analyze.
+categories <- c(
+  "Food", "Cigarettes and tobacco", "Alcoholic beverages", "Clothing and footwear",
+  "Rent and other dwelling services", "Electricity, gas and other fuel",
+  "Furnishings and household equipment", "Health", "Transport", "Communications",
+  "Recreation and culture", "Education services", "Hotels, cafes and restaurants",
+  "Insurance and other financial services", "Other goods and services"
+)
+
+# Define a function to find the specific ABS Series IDs for a given category name.
+find_hfce_series <- function(data, category_name) {
+  
+  # Find the "Current Prices" series (Nominal value) for the category.
+  # Filters by category name, "Current prices", and excludes totals/percentages.
+  cp_series <- data %>% 
+    filter(grepl(category_name, series, ignore.case = TRUE),
+           grepl("Current prices", series, ignore.case = TRUE),
+           !grepl("Total", series, ignore.case = TRUE),
+           !grepl("Percentage", series, ignore.case = TRUE)) %>%
+    arrange(series) %>% head(1) # Take the first match.
+    
+  # Find the "Chain Volume Measures" series (Real quantity) for the category.
+  cvm_series <- data %>% 
+    filter(grepl(category_name, series, ignore.case = TRUE),
+           grepl("Chain volume measures", series, ignore.case = TRUE),
+           !grepl("Total", series, ignore.case = TRUE),
+           !grepl("Percentage", series, ignore.case = TRUE)) %>%
+    arrange(series) %>% head(1) # Take the first match.
+  
+  # If either series is missing, return NULL (skip this category).
+  if(nrow(cp_series) == 0 | nrow(cvm_series) == 0) return(NULL)
+  
+  # Return a single-row table linking the category name to its Price ID and Quantity ID.
+  tibble(category = category_name, cp_series_id = cp_series$series_id, cvm_series_id = cvm_series$series_id)
+}
+
+
+# Apply the finding function to all 15 categories and combine the results into one lookup table.
+mapping_table <- map_dfr(categories, ~find_hfce_series(hfce_q, .x))
+
+# Save this mapping table to a CSV file for reference/debugging.
+write_csv(mapping_table, "outputs/hfce_cpi_mapping_lookup.csv")
+
+
+
+# JOEL 1 Definitive 15-Category Map for RBA "Approach 1"
+# HFCE Category (Quantities)                  -> CPI Group/Sub-group (Prices)
+model_mapping <- tribble(
+  ~hfce_name,                                      ~cpi_match,
+  "Food",                                          "Food and non-alcoholic beverages",
+  "Alcoholic beverages",                           "Alcohol and tobacco",
+  "Cigarettes and tobacco",                        "Alcohol and tobacco",
+  "Clothing and footwear",                         "Clothing and footwear",
+  "Rent and other dwelling services",              "Rents", # Use specific sub-group "Rents" if available, else "Housing"
+  "Electricity, gas and other fuel",               "Utilities", # or "Electricity" + "Gas" combined, often "Housing" group is used as proxy if sub-indices distinct
+  "Furnishings and household equipment",           "Furnishings, household equipment and services",
+  "Health",                                        "Health",
+  "Purchase of vehicles",                          "Transport", # Or specific "Motor vehicles" CPI subgroup
+  "Operation of vehicles",                         "Transport", # Or "Automotive fuel" + Maint
+  "Transport services",                            "Transport", # Or "Urban transport fares"
+  "Communications",                                "Communication",
+  "Recreation and culture",                        "Recreation and culture",
+  "Education services",                            "Education",
+  "Hotels, cafes and restaurants",                 "Food and non-alcoholic beverages" # Often mapped here or strictly "Restaurant meals" subgroup
+)
+
+
+```
+
+### Chunk 5: Data Transformation (Implicit Prices & Quantities)
+```{r transformation}
+# Print status message.
+message("Transforming Data...")
+
+# Create the dataset for modelling.
+model_data <- hfce_q %>%
+  # Keep only the series IDs that were identified in our mapping table.
+  filter(series_id %in% c(mapping_table$cp_series_id, mapping_table$cvm_series_id)) %>%
+  # Select only date, ID, and value columns.
+  dplyr::select(join_date, series_id, value) %>%
+  # Join with the mapping table to attach the category name and type (CP or CVM).
+  left_join(mapping_table %>% pivot_longer(cols = c(cp_series_id, cvm_series_id), names_to = "type", values_to = "series_id"), by = "series_id") %>%
+  # Rename the type column to simple "CP" or "CVM".
+  mutate(type = if_else(type == "cp_series_id", "CP", "CVM")) %>%
+  # Remove the raw series ID column as we now have the mapped names.
+  dplyr::select(-series_id) %>%
+  # Reshape the data wide: Columns become Date, Category, CP, CVM.
+  pivot_wider(names_from = type, values_from = value) %>%
+  # Remove rows where either Price or Quantity data is missing.
+  filter(!is.na(CP), !is.na(CVM)) %>%
+  # Calculate indices:
+  # Price_Index = (Nominal / Real) * 100 (Implicit Price Deflator).
+  # Quantity_Index = Real Volume.
+  mutate(Price_Index = (CP / CVM) * 100, Quantity_Index = CVM) %>%
+  # Sort by Category then Date.
+  arrange(category, join_date) %>%
+  # Group by Category to calculate growth rates specific to each group.
+  group_by(category) %>%
+  # Calculate log-differences (approximate quarterly percentage change) for Price and Quantity.
+  mutate(d_ln_P = log(Price_Index) - lag(log(Price_Index)), d_ln_Q = log(Quantity_Index) - lag(log(Quantity_Index))) %>%
+  ungroup() %>%
+  # Group by Date to calculate the relative weight of each category in that specific quarter.
+  group_by(join_date) %>%
+  # Calculate Weight: Category's share of total nominal expenditure in that quarter.
+  mutate(Weight = CP / sum(CP, na.rm = TRUE)) %>%
+  ungroup() %>%
+  # Remove the first row (NA due to lag calculation).
+  filter(!is.na(d_ln_P), !is.na(d_ln_Q))
+```
+
+### Chunk 6: Rolling VAR Model (Shapiro Methodology)
+```{r modelling}
+# Print status message.
+message("Running Rolling VAR...")
+
+# Define the Rolling VAR function.
+# Inputs: A single category's data history, window size (default 40 quarters / 10 years).
+run_rolling_var <- function(sub_data, window_size = 40) {
+  # Ensure data is sorted by date.
+  sub_data <- sub_data %>% arrange(join_date)
+  n <- nrow(sub_data)
+  results <- list()
+  
+  # If history is shorter than the window, we cannot run the model. Return NULL.
+  if(n <= window_size) return(NULL)
+  
+  # Loop through time, starting from the first point after the initial window.
+  for(i in (window_size + 1):n) {
+    # Define the estimation window indices (e.g., from t-39 to t).
+    window_start <- i - window_size + 1
+    slice_data <- sub_data[window_start:i, ]
+    # Identify the date we are classifying (the last date in the current window).
+    current_date <- slice_data$join_date[window_size] 
+    
+    # Extract the Price and Quantity changes for the window into a matrix.
+    y <- slice_data %>% dplyr::select(d_ln_P, d_ln_Q) %>% as.matrix()
+    
+    # Skip if any NAs are present in the window.
+    if(any(is.na(y))) next
+    
+    # Attempt to fit the Vector Autoregression (VAR).
+    tryCatch({
+      # Fit a VAR model with 4 lags and a constant.
+      var_model <- VAR(y, p = 4, type = "const")
+      
+      # Extract residuals (unexpected shocks) from the model.
+      resids <- residuals(var_model)
+      # We care about the shock at time 't' (the last row).
+      last_resid <- resids[nrow(resids), ]
+      
+      # Calculate standard deviation of residuals over the window.
+      sigma <- apply(resids, 2, sd)
+      # Calculate t-statistics for the current shock.
+      t_stats <- last_resid / sigma
+      
+      # Classification Logic (Shapiro 2022):
+      threshold <- 0.25
+      # If both shocks are statistically small (< 0.25 sigma), label as "Ambiguous".
+      is_ambiguous <- all(abs(t_stats) < threshold)
+      label <- "Ambiguous"
+      
+      if(!is_ambiguous) {
+        # If Price and Quantity shocks move in SAME direction (+/+ or -/-) -> Demand.
+        if(sign(last_resid[1]) == sign(last_resid[2])) label <- "Demand" 
+        # If Price and Quantity shocks move in OPPOSITE direction (+/- or -/+) -> Supply.
+        else label <- "Supply"
+      }
+      # Store the result for this date.
+      results[[length(results) + 1]] <- tibble(join_date = current_date, label = label)
+    }, error = function(e) return(NULL)) # If VAR fails (e.g. singular matrix), return NULL.
+  }
+  # Combine list of results into a single data frame.
+  bind_rows(results)
+}
+
+# Apply the Rolling VAR function to every category in the dataset.
+results_all <- model_data %>%
+  group_split(category) %>%
+  map_dfr(function(df) {
+    res <- run_rolling_var(df, window_size = 40)
+    # Add the category name back to the results.
+    if(!is.null(res)) res$category <- unique(df$category)
+    return(res)
+  })
+
+# Merge the classifications (Supply/Demand/Ambiguous) back into the main data.
+final_data <- model_data %>% inner_join(results_all, by = c("join_date", "category"))
+```
+
+### Chunk 6a: CPI Weights
+```{r cpi_weights}
+# Fetch the 2023 CPI Weighting Pattern (17th Series).
+# Since these are static values from the ABS Information Paper (6473.0), we define them directly
+# to ensure accuracy and reproducibility without relying on volatile publication URLs.
+
+# 2023 CPI Weights (ABS 6473.0, Table 1)
+cpi_weights_2023 <- tibble(
+  CPI_Group = c("Food and non-alcoholic beverages", "Alcohol and tobacco", "Clothing and footwear", 
+                "Housing", "Furnishings, household equipment and services", "Health", "Transport", 
+                "Communication", "Recreation and culture", "Education", "Insurance and financial services"),
+  Weight_CPI_Group = c(17.15, 7.70, 3.06, 21.74, 8.75, 6.16, 11.55, 2.41, 12.55, 4.36, 4.57)
+)
+
+# Define a Crosswalk to map the 15 HFCE Categories to the 11 CPI Groups.
+hfce_cpi_crosswalk <- tibble(
+  category = c(
+    "Food", 
+    "Cigarettes and tobacco", "Alcoholic beverages", 
+    "Clothing and footwear", 
+    "Rent and other dwelling services", "Electricity, gas and other fuel", 
+    "Furnishings and household equipment", 
+    "Health", 
+    "Transport", 
+    "Communications", 
+    "Recreation and culture", "Hotels, cafes and restaurants", 
+    "Education services", 
+    "Insurance and other financial services", "Other goods and services"
+  ),
+  CPI_Group = c(
+    "Food and non-alcoholic beverages",
+    "Alcohol and tobacco", "Alcohol and tobacco",
+    "Clothing and footwear",
+    "Housing", "Housing",
+    "Furnishings, household equipment and services",
+    "Health",
+    "Transport",
+    "Communication",
+    "Recreation and culture", "Recreation and culture",
+    "Education",
+    "Insurance and financial services", "Insurance and financial services"
+  )
+)
+
+# Add the CPI Weights to the existing mapping_table.
+# Note: We use 'Weight_CPI' to store the group-level weight.
+mapping_table <- mapping_table %>%
+  left_join(hfce_cpi_crosswalk, by = "category") %>%
+  left_join(cpi_weights_2023, by = "CPI_Group") %>%
+  rename(Weight_CPI = Weight_CPI_Group)
+
+print("Updated Mapping Table with CPI Weights:")
+print(mapping_table)
+```
+
+### Chunk 7: Decomposition and Aggregation
+```{r decomposition}
+# Print status message.
+message("Decomposing...")
+
+# Aggregate the results.
+decomposition <- final_data %>%
+  # Attach the CPI Weights from the mapping table created in Chunk 6a.
+  left_join(mapping_table %>% dplyr::select(category, Weight_CPI), by = "category") %>%
+  # Calculate the contribution of this specific category to total inflation using CPI weights.
+  # We use Weight_CPI / 100 to convert the percentage-point weights (e.g. 17.15) into fractions.
+  mutate(contribution = d_ln_P * (Weight_CPI / 100)) %>%
+  # Group by Date and Label (Supply/Demand/Ambiguous).
+  group_by(join_date, label) %>%
+  # Sum the contributions for each label.
+  summarise(value = sum(contribution), .groups = 'drop') %>%
+  # Pivot to wide format: Date | Demand | Supply | Ambiguous.
+  pivot_wider(names_from = label, values_from = value, values_fill = 0) %>%
+  # Calculate the Total Modeled Inflation (Sum of components).
+  mutate(Total_Modeled_Q = Demand + Supply + Ambiguous)
+
+# Create Year-Ended (Rolling Annual) versions for plotting.
+decomposition_yoy <- decomposition %>%
+  arrange(join_date) %>%
+  mutate(
+    # Sum the last 4 quarters for each component.
+    Demand_YoY = rollsum(Demand, 4, fill = NA, align = "right"),
+    Supply_YoY = rollsum(Supply, 4, fill = NA, align = "right"),
+    Ambiguous_YoY = rollsum(Ambiguous, 4, fill = NA, align = "right"),
+    Total_Modeled_YoY = rollsum(Total_Modeled_Q, 4, fill = NA, align = "right")
+  ) %>%
+  # Remove rows where the 4-quarter sum couldn't be calculated (start of series).
+  filter(!is.na(Total_Modeled_YoY)) %>%
+  # Convert log-difference sums to approximate percentages (multiply by 100).
+  mutate(across(ends_with("YoY"), ~ . * 100))
+```
+
+### Chunk 8: Visualization
+```{r visualization}
+# Print status message.
+message("Visualizing...")
+
+# Merge the Decomposition data with the Headline CPI data.
+plot_data <- decomposition_yoy %>%
+  left_join(cpi_headline, by = "join_date") %>%
+  # Filter to show data only from 2010 onwards.
+  filter(join_date >= as.Date("2010-01-01"))
+
+# Reshape data for the Stacked Bar Chart (Long format).
+plot_long <- plot_data %>%
+  dplyr::select(join_date, Demand_YoY, Supply_YoY, Ambiguous_YoY) %>%
+  pivot_longer(cols = -join_date, names_to = "Component", values_to = "Value") %>%
+  # Clean up the names (remove "_YoY" suffix) for the legend.
+  mutate(Component = gsub("_YoY", "", Component))
+
+# Determine the last valid data point for annotation.
+last_valid <- plot_data %>% filter(!is.na(CPI_YoY)) %>% tail(1)
+if(nrow(last_valid) > 0) {
+  last_val <- round(last_valid$CPI_YoY, 1)
+  last_date <- last_valid$join_date
+} else {
+  last_val <- "NA"
+  last_date <- max(plot_data$join_date)
+}
+
+# Construct the Plot using ggplot2.
+p <- ggplot() +
+  # Add Stacked Bars for the components (Supply/Demand/Ambiguous).
+  geom_col(data = plot_long, aes(x = join_date, y = Value, fill = Component), width = 90, alpha = 0.9) +
+  # Add the Line for Headline CPI.
+  geom_line(data = plot_data %>% filter(!is.na(CPI_YoY)), aes(x = join_date, y = CPI_YoY, color = "Headline CPI"), size = 1.2) +
+  # Define custom colors.
+  scale_fill_manual(values = c("Demand" = "red", "Supply" = "blue", "Ambiguous" = "grey")) +
+  scale_color_manual(values = c("Headline CPI" = "black")) +
+  # Annotate the COVID-19 period with a yellow shaded rectangle.
+  annotate("rect", xmin = as.Date("2020-03-01"), xmax = as.Date("2021-12-31"), ymin = -Inf, ymax = Inf, alpha = 0.15, fill = "yellow") +
+  # Add text label for COVID-19.
+  annotate("text", x = as.Date("2020-09-01"), y = 5, label = "COVID-19", vjust = -0.5, size = 3.5, fontface = "bold") +
+  # Annotate the final CPI value at the end of the line.
+  annotate("text", x = last_date, y = as.numeric(last_val), label = paste0(last_val, "%"), hjust = -0.3, vjust = 0.5, fontface = "bold", size = 4) +
+  # Add labels and captions.
+  labs(title = "Decomposition of Australian Inflation (Supply vs Demand)", subtitle = "RBA / Shapiro (2022) Methodology", y = "Year-ended Inflation (%)", x = NULL, caption = "Source: ABS, RBA") +
+  # Apply minimal theme and adjust legend position.
+  theme_minimal() + theme(legend.position = "bottom") + 
+  # Format x-axis dates.
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y")
+
+# Save the plot as a PNG file.
+ggsave("outputs/inflation_decomposition.png", plot = p, width = 10, height = 6, bg = "white")
+
+# Save the plot data as a CSV file.
+write_csv(plot_data, "outputs/inflation_decomposition_data.csv")
+
+# Print final status message.
+message("Done.")
+```
