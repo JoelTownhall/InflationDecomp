@@ -275,13 +275,10 @@ results_all <- model_data %>%
 final_data <- model_data %>% inner_join(results_all, by = c("join_date", "category"))
 ```
 
-### Chunk 6a: CPI Weights
+### Chunk 6a: CPI Weights and Split
 ```{r cpi_weights}
-# Fetch the 2023 CPI Weighting Pattern (17th Series).
-# Since these are static values from the ABS Information Paper (6473.0), we define them directly
-# to ensure accuracy and reproducibility without relying on volatile publication URLs.
-
-# 2023 CPI Weights (ABS 6473.0, Table 1)
+# 1. Define 2023 CPI Weights (ABS 6473.0, Table 1 - 17th Series)
+# These are the aggregate weights for the CPI Groups.
 cpi_weights_2023 <- tibble(
   CPI_Group = c("Food and non-alcoholic beverages", "Alcohol and tobacco", "Clothing and footwear", 
                 "Housing", "Furnishings, household equipment and services", "Health", "Transport", 
@@ -289,7 +286,7 @@ cpi_weights_2023 <- tibble(
   Weight_CPI_Group = c(17.15, 7.70, 3.06, 21.74, 8.75, 6.16, 11.55, 2.41, 12.55, 4.36, 4.57)
 )
 
-# Define a Crosswalk to map the 15 HFCE Categories to the 11 CPI Groups.
+# 2. Define Crosswalk (HFCE Category -> CPI Group)
 hfce_cpi_crosswalk <- tibble(
   category = c(
     "Food", 
@@ -319,15 +316,44 @@ hfce_cpi_crosswalk <- tibble(
   )
 )
 
-# Add the CPI Weights to the existing mapping_table.
-# Note: We use 'Weight_CPI' to store the group-level weight.
-mapping_table <- mapping_table %>%
-  left_join(hfce_cpi_crosswalk, by = "category") %>%
-  left_join(cpi_weights_2023, by = "CPI_Group") %>%
-  rename(Weight_CPI = Weight_CPI_Group)
+# 3. Calculate HFCE Shares within CPI Groups
+# We use the most recent full year of data (e.g., 2023) from our model_data to split the weights.
+# For example, if Alcohol is $100 and Tobacco is $50, Alcohol gets 2/3 of the CPI Group weight.
 
-print("Updated Mapping Table with CPI Weights:")
-print(mapping_table)
+hfce_split_shares <- model_data %>%
+  # Filter for 2023 to align with the weighting reference period
+  filter(year(join_date) == 2023) %>%
+  group_by(category) %>%
+  summarise(Annual_CP = sum(CP, na.rm = TRUE), .groups = "drop") %>%
+  # Attach CPI Group
+  left_join(hfce_cpi_crosswalk, by = "category") %>%
+  # Calculate Share within Group
+  group_by(CPI_Group) %>%
+  mutate(
+    Group_Total_CP = sum(Annual_CP, na.rm = TRUE),
+    Share_In_Group = Annual_CP / Group_Total_CP
+  ) %>%
+  ungroup() %>%
+  dplyr::select(category, CPI_Group, Share_In_Group)
+
+# 4. Update Mapping Table with Split Weights
+mapping_table <- mapping_table %>%
+  # Remove old columns if they exist to avoid duplication
+  dplyr::select(category, cp_series_id, cvm_series_id) %>%
+  left_join(hfce_split_shares, by = "category") %>%
+  left_join(cpi_weights_2023, by = "CPI_Group") %>%
+  # Calculate the final split weight
+  mutate(
+    Weight_CPI = Weight_CPI_Group * Share_In_Group
+  )
+
+print("Updated Mapping Table with Split CPI Weights:")
+print(mapping_table %>% dplyr::select(category, CPI_Group, Weight_CPI_Group, Share_In_Group, Weight_CPI))
+
+final_data <- final_data %>% 
+  #dplyr::select(-Weight_CPI) %>% 
+  left_join(mapping_table %>% dplyr::select(category, Weight_CPI), by = "category")
+
 ```
 
 ### Chunk 7: Decomposition and Aggregation
@@ -336,9 +362,7 @@ print(mapping_table)
 message("Decomposing...")
 
 # Aggregate the results.
-decomposition <- final_data %>%
-  # Attach the CPI Weights from the mapping table created in Chunk 6a.
-  left_join(mapping_table %>% dplyr::select(category, Weight_CPI), by = "category") %>%
+decomposition <- final_data  %>%
   # Calculate the contribution of this specific category to total inflation using CPI weights.
   # We use Weight_CPI / 100 to convert the percentage-point weights (e.g. 17.15) into fractions.
   mutate(contribution = d_ln_P * (Weight_CPI / 100)) %>%
@@ -364,7 +388,12 @@ decomposition_yoy <- decomposition %>%
   # Remove rows where the 4-quarter sum couldn't be calculated (start of series).
   filter(!is.na(Total_Modeled_YoY)) %>%
   # Convert log-difference sums to approximate percentages (multiply by 100).
-  mutate(across(ends_with("YoY"), ~ . * 100))
+  mutate(across(ends_with("YoY"), ~ . * 100)) %>%
+  # Attach Headline CPI to calculate the 'Unknown' residual (Headline - (Demand + Supply))
+  left_join(cpi_headline, by = "join_date") %>%
+  mutate(Unknown_YoY = CPI_YoY - (Demand_YoY + Supply_YoY)) %>%
+  # Remove CPI_YoY to avoid duplication when it is joined again in Chunk 8
+  dplyr::select(-CPI_YoY)
 ```
 
 ### Chunk 8: Visualization
@@ -422,6 +451,38 @@ ggsave("outputs/inflation_decomposition.png", plot = p, width = 10, height = 6, 
 
 # Save the plot data as a CSV file.
 write_csv(plot_data, "outputs/inflation_decomposition_data.csv")
+
+# --- Alternative Graph (Unknown/Residual) ---
+
+# Reshape for Alternative Plot (Demand, Supply, Unknown)
+# We replace 'Ambiguous' with 'Unknown' (which absorbs Ambiguous + Error)
+plot_long_alt <- plot_data %>%
+  dplyr::select(join_date, Demand_YoY, Supply_YoY, Unknown_YoY) %>%
+  pivot_longer(cols = -join_date, names_to = "Component", values_to = "Value") %>%
+  mutate(Component = gsub("_YoY", "", Component))
+
+# Construct the Alternative Plot
+p_alt <- ggplot() +
+  # Stacked Bars (Unknown in Grey)
+  geom_col(data = plot_long_alt, aes(x = join_date, y = Value, fill = Component), width = 90, alpha = 0.9) +
+  # Headline Line
+  geom_line(data = plot_data %>% filter(!is.na(CPI_YoY)), aes(x = join_date, y = CPI_YoY, color = "Headline CPI"), size = 1.2) +
+  # Colors
+  scale_fill_manual(values = c("Demand" = "red", "Supply" = "blue", "Unknown" = "grey")) +
+  scale_color_manual(values = c("Headline CPI" = "black")) +
+  # Annotations
+  annotate("rect", xmin = as.Date("2020-03-01"), xmax = as.Date("2021-12-31"), ymin = -Inf, ymax = Inf, alpha = 0.15, fill = "yellow") +
+  annotate("text", x = as.Date("2020-09-01"), y = 5, label = "COVID-19", vjust = -0.5, size = 3.5, fontface = "bold") +
+  annotate("text", x = last_date, y = as.numeric(last_val), label = paste0(last_val, "%"), hjust = -0.3, vjust = 0.5, fontface = "bold", size = 4) +
+  # Labels
+  labs(title = "Decomposition of Australian Inflation (Supply vs Demand)", 
+       subtitle = "RBA / Shapiro (2022) Methodology (Residual = Unknown)", 
+       y = "Year-ended Inflation (%)", x = NULL, caption = "Source: ABS, RBA. 'Unknown' forces sum to Headline.") +
+  theme_minimal() + theme(legend.position = "bottom") + 
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y")
+
+# Save Alternative Plot
+ggsave("outputs/inflation_decomposition_alternative.png", plot = p_alt, width = 10, height = 6, bg = "white")
 
 # Print final status message.
 message("Done.")
